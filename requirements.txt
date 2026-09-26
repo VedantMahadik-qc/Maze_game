@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn>=0.29
+numpy>=1.26
+# The parked Atlas tooling (atlas_bridge_parked.py, moth_client.py, probe_atlas_engines.py)
+# additionally needs: httpx, diskcache, requests. The game itself does not.

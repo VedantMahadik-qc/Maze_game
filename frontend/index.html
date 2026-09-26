@@ -3,25 +3,108 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Quantum Chase Horror -- prototype</title>
+    <title>Quantum Chase</title>
   </head>
   <body>
-    <div id="blocker">
-      <div id="menu">
-        <h1>[Working title]</h1>
-        <p>Reach the exit. Duck into rooms to break line of sight.<br />
-           Stay in corridors too long and it gets you.</p>
-        <p class="hint">WASD to move, mouse to look, Shift to sprint, click to start</p>
+    <div id="crosshair"></div>
+
+    <div id="hud">
+      <div id="hud-top-left">
+        <div id="status-line">
+          <span>ENGINE: LOCAL 16-QUBIT LATTICE (EMULATED)</span> &middot; <span id="status-source" class="warn">&mdash;</span>
+        </div>
+        <div id="room-line" class="safe"></div>
+        <div class="dim small">[TAB] telemetry &middot; safe rooms refill stamina</div>
+      </div>
+
+      <div id="transition-banner" class="hidden">
+        <div class="tb-title">&lang;ZZ&rang; SAMPLING</div>
+        <div class="tb-sub" id="transition-sub"></div>
+      </div>
+      <div id="collapse-banner" class="hidden">SUPERPOSITION COLLAPSED</div>
+
+      <div id="hud-bottom">
+        <div class="bar-label"><span>PROXIMITY</span><span id="proximity-value">0.00</span></div>
+        <div id="proximity-bar"><div id="proximity-fill"></div></div>
+        <div id="stamina-bar"><div id="stamina-fill"></div></div>
+      </div>
+
+      <div id="toast" class="hidden"></div>
+    </div>
+
+    <aside id="telemetry" class="hidden">
+      <header><span>QUANTUM TELEMETRY</span><kbd>TAB</kbd></header>
+      <dl>
+        <dt>Engine</dt>
+        <dd>LOCAL 16-QUBIT LATTICE (EMULATED)</dd>
+        <dt>Mode</dt>
+        <dd>exact statevector circuit, 1024 shots <span class="dim">&middot; no Moth, no QPU, no network</span></dd>
+        <dt>Lattice</dt>
+        <dd>Active Qubits: 16 | Coupling Edges: 24 <span class="dim">(4&times;4)</span></dd>
+        <dt>Proximity scalar</dt>
+        <dd><span id="t-prox">0.00</span> <span class="meter"><span id="t-prox-fill"></span></span></dd>
+        <dt>You are in</dt>
+        <dd id="t-place">&mdash;</dd>
+        <dt>Sampler status</dt>
+        <dd id="t-status" class="warn">no sample yet</dd>
+        <dt>Last sample</dt>
+        <dd id="t-sample">&mdash;</dd>
+        <dt>Sampler link</dt>
+        <dd id="t-sampler">&mdash;</dd>
+        <dt>Guards</dt>
+        <dd id="t-guard">&mdash;</dd>
+        <dt>Retrocausal</dt>
+        <dd><span id="t-retro-dot"></span> <span id="t-retro">footsteps play 0.90 s ahead</span></dd>
+      </dl>
+      <div class="t-section">ACTIVE ZZ CORRELATION EDGE SIGNS</div>
+      <svg id="t-map" viewBox="0 0 220 220" aria-label="4 by 4 qubit lattice with edge signs"></svg>
+      <div class="legend">
+        <span class="open">+1 open</span><span class="wall">&minus;1 wall</span><span class="guard">guard flip</span><span class="occ">held</span>
+      </div>
+      <div class="t-caption dim">24 edges: name &middot; sign &middot; &lang;ZZ&rang; over 1024 shots</div>
+      <ol id="t-edges"></ol>
+    </aside>
+
+    <div id="blocker" class="overlay">
+      <div class="panel">
+        <div class="kicker">MOTH HACK 2026 &middot; QUANTUM GAME</div>
+        <h1>QUANTUM CHASE</h1>
+        <p class="lede">
+          Sixteen rooms, sixteen qubits. Something is awake in the corridors, and it hunts you the
+          moment you move. Duck into a <b class="ok">safe room</b> &mdash; it can't follow you in. But every
+          time you do, the house collapses into a new arrangement: each of the 24 corridors' ZZ
+          correlation reads <b class="ok">+1</b> (open) or <b class="bad">&minus;1</b> (sealed). Cross from the
+          Foyer (<b>q0</b>) to the exit (<b class="ok">q15</b>).
+        </p>
+        <ul class="controls">
+          <li><kbd>WASD</kbd> move</li>
+          <li><kbd>Mouse</kbd> look</li>
+          <li><kbd>Shift</kbd> sprint</li>
+          <li><kbd>Tab</kbd> telemetry</li>
+          <li><kbd>R</kbd> restart</li>
+        </ul>
+        <div id="sampler-status" class="bridge">Checking local sampler&hellip;</div>
+        <div class="cta">CLICK TO ENTER</div>
       </div>
     </div>
-    <div id="hud">
-      <div id="proximity-bar"><div id="proximity-fill"></div></div>
+
+    <div id="pause" class="overlay hidden">
+      <div class="panel">
+        <h2>PAUSED</h2>
+        <p id="pause-note" class="dim"></p>
+        <div class="cta">CLICK TO RESUME &middot; <kbd>R</kbd> RESTART</div>
+      </div>
     </div>
-    <div id="end-screen" class="hidden">
-      <h1 id="end-title"></h1>
-      <p class="hint">Click to try again</p>
+
+    <div id="end-screen" class="overlay hidden">
+      <div class="panel">
+        <h1 id="end-title"></h1>
+        <div id="end-sub"></div>
+        <div id="end-stats"></div>
+        <div class="cta">PRESS <kbd>R</kbd> TO RESTART</div>
+      </div>
     </div>
-    <div id="static-overlay"></div>
+
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

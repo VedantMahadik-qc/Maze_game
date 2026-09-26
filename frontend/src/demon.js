@@ -1,205 +1,444 @@
-// The thing chasing the player. Per playtest feedback, a fully invisible
-// "decoherence timer" didn't read as a threat -- it needs an actual position
-// to run from. Still deliberately unmodeled (no rig, no animation beyond a
-// slow spin): a capsule whose skin uses the same trick as quantum-3d-clerk's
-// customer.js `cold static hum` tell (skinMat.emissive punched randomly each
-// frame) rather than a new visual effect. That flicker is also the one
-// concession to "emergent decoherence" from the original design -- it reads
-// as a glitching presence, not a modeled monster.
+// The thing chasing the player: an unmodeled capsule skinned in animated TV
+// static (the brief's "decoherence made visible" -- no rig, no character).
 //
-// Movement: BFS over the maze's own corridor graph (no navmesh needed at
-// this grid size), retargeted a few times a second at the player's current
-// cell -- or, if the player is in a room, at the nearest real doorway, since
-// the demon is not allowed to enter rooms. Rooms stay genuinely safe.
+// It lives only in hubs and corridors: safe rooms are not part of the
+// navigation graph, so it cannot enter one. Two behaviours:
+//   hunt    -- the player is exposed: shortest walkable route to them,
+//              re-planned several times a second and immediately whenever
+//              the maze is re-sampled. It speeds up the longer the run goes.
+//   patrol  -- the player is in a safe room: it gives up the chase and
+//              wanders the outer corridors at a slower pace, keeping its
+//              distance from the room instead of camping at the door.
+// If a reshuffle strands it (sealed in a corridor, or unable to reach an
+// exposed player) it decoheres and re-materializes elsewhere instead of
+// standing still.
+//
+// Retrocausal cues: the demon reports events *ahead* of itself for audio --
+// footsteps are emitted from where it will be RETRO_LEAD seconds from now,
+// a doorway "threshold" click fires before it comes through a mouth into the
+// player's hub, and a pre-echo plays at a spawn point before it materializes.
 
 import * as THREE from "three";
+import { planPath, distanceField, spawnCandidates, canLeave } from "./maze.js";
 
-const DEMON_HEIGHT = 2.1;
-const DEMON_RADIUS = 0.3;
-const DEMON_SPEED = 2.5;
-const RETARGET_INTERVAL = 0.4;
-const WAYPOINT_EPS = 0.15;
+const BASE_SPEED = 2.8;
+const MAX_SPEED = 6.6;
+const ACCEL = 0.05; // speed gained per second since it appeared
+const PATROL_FACTOR = 0.55; // patrol pace relative to chase pace
+const REPATH_INTERVAL = 0.2;
+const TUNNEL_AFTER = 1.1; // seconds with no route to the player before it decoheres
+const STRANDED_AFTER = 1.2; // seconds shut in while patrolling before it decoheres
+const DECOHERE_TIME = 0.6;
+const MATERIALIZE_TIME = 0.5;
+const PATROL_MIN_LEG = 6; // patrol destinations at least this far (walking) away
+const PATROL_KEEP_AWAY = 10; // ...and at least this far from the player's room
+const PATROL_NEAR_RANGE = 30; // prefer destinations this close to the player: it lurks nearby
+const HEIGHT = 2.1;
+const RADIUS = 0.36;
+export const RETRO_LEAD = 0.9;
 
-// Always-on baseline glow so it reads as a shape at a distance, independent
-// of the proximity-scaled flicker below (which used to be the *only*
-// source of emissive -- nearly invisible until proximity was already high).
-const BASE_EMISSIVE_G = 0.12;
-const BASE_EMISSIVE_B = 0.22;
-const DEMON_LIGHT_BASE = 9; // candela, always on
-const DEMON_LIGHT_EXTRA = 16; // added on top as proximity -> 1
+const vertexShader = /* glsl */ `
+  varying vec2 vUv;
+  varying vec3 vN;
+  varying vec3 vV;
+  void main() {
+    vUv = uv;
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    vN = normalize(normalMatrix * normal);
+    vV = normalize(-mv.xyz);
+    gl_Position = projectionMatrix * mv;
+  }
+`;
 
-const DIRS = [
-  { dx: 0, dy: -1, wall: "N" },
-  { dx: 1, dy: 0, wall: "E" },
-  { dx: 0, dy: 1, wall: "S" },
-  { dx: -1, dy: 0, wall: "W" },
-];
+const fragmentShader = /* glsl */ `
+  uniform float uTime;
+  uniform float uIntensity;
+  uniform float uDissolve;
+  varying vec2 vUv;
+  varying vec3 vN;
+  varying vec3 vV;
+  float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
+  void main() {
+    vec2 cell = floor(vUv * vec2(36.0, 90.0));
+    if (hash(cell * 0.73 + 11.0) < uDissolve) discard;
+    float frame = floor(uTime * 24.0);
+    float n = hash(cell + frame * 1.618);
+    float band = step(0.9 - uIntensity * 0.2, hash(vec2(floor(vUv.y * 30.0), frame)));
+    float scan = 0.7 + 0.3 * sin(vUv.y * 420.0 - uTime * 40.0);
+    float rim = pow(1.0 - max(dot(normalize(vN), normalize(vV)), 0.0), 2.2);
+    vec3 col = mix(vec3(0.01, 0.02, 0.04), vec3(0.75, 0.95, 1.0), n * scan);
+    col *= 0.55 + 0.9 * uIntensity;
+    col += band * vec3(0.9, 0.15, 0.3) * 0.8;
+    col += rim * vec3(0.25, 0.85, 1.0) * (1.2 + 1.5 * uIntensity);
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
 
 export class Demon {
-  constructor(house, scene) {
-    this.house = house;
-    this.speed = DEMON_SPEED;
-
-    this.material = new THREE.MeshStandardMaterial({
-      color: 0x0a0c14,
-      roughness: 0.4,
-      emissive: new THREE.Color(0, BASE_EMISSIVE_G, BASE_EMISSIVE_B),
-    });
-    const geo = new THREE.CapsuleGeometry(DEMON_RADIUS, DEMON_HEIGHT - DEMON_RADIUS * 2, 4, 8);
-    this.mesh = new THREE.Mesh(geo, this.material);
-    this.mesh.castShadow = true;
-    scene.add(this.mesh);
-
-    // Playtest note: pure material flicker wasn't enough to see it coming
-    // down a corridor -- a real light source is what actually sells "a
-    // glowing thing is approaching," on top of the flicker for instability.
-    this.light = new THREE.PointLight(0x33ccff, DEMON_LIGHT_BASE, 11, 1.7);
-    scene.add(this.light);
-
-    this._path = [];
-    this._retargetTimer = 0;
-    this._flickerTimer = 0;
-
+  constructor(scene) {
+    this.uniforms = { uTime: { value: 0 }, uIntensity: { value: 0 }, uDissolve: { value: 1 } };
+    this.mesh = new THREE.Mesh(
+      new THREE.CapsuleGeometry(RADIUS, HEIGHT - RADIUS * 2, 8, 20),
+      new THREE.ShaderMaterial({ uniforms: this.uniforms, vertexShader, fragmentShader })
+    );
+    this.light = new THREE.PointLight(0x5fe3ff, 0, 10, 1.8);
+    scene.add(this.mesh, this.light);
+    this.pos = new THREE.Vector3();
     this.reset();
   }
 
   reset() {
-    const spawn = this._spawnPosition();
-    this.mesh.position.copy(spawn);
-    this.light.position.set(spawn.x, spawn.y + 0.3, spawn.z);
-    this._path = [];
-    this._retargetTimer = 0;
+    this.state = "dormant"; // dormant | incoming | materializing | active | decohering | retry
+    this.mode = "patrol"; // patrol | hunt (while active)
+    this.mesh.visible = false;
+    this.light.intensity = 0;
+    this.path = [];
+    this.hasRoute = false;
+    this.noRouteFor = 0;
+    this.strandedFor = 0;
+    this.patrolWait = 0;
+    this.chaseTime = 0;
+    this.stepTimer = 0.4;
+    this.repathTimer = 0;
+    this.graphVersion = -1;
+    this.timer = 0;
+    this.dissolve = 1;
+    this.spawnAt = null;
+    this.cued = null;
+    this.cueHub = -1;
+    this._jitterTimer = 0;
+    this._jitter = new THREE.Vector3();
   }
 
-  _spawnPosition() {
-    // Deep in the house, away from the start room, so the first encounter
-    // comes after some exploration rather than at the spawn door.
-    const far = this.house.exitRoom ?? this.house.rooms[this.house.rooms.length - 1];
-    const c = this.house.toWorld(far.cx + 0.5, far.cy + 0.5); // true center of the 2x2 room block
-    return new THREE.Vector3(c.x, DEMON_HEIGHT / 2, c.z);
+  get present() {
+    return this.state === "active" || this.state === "materializing";
   }
 
-  distanceTo(worldPos) {
-    return Math.hypot(this.mesh.position.x - worldPos.x, this.mesh.position.z - worldPos.z);
+  get canCatch() {
+    return this.state === "active";
   }
 
-  update(dt, elapsed, playerWorldPos, proximity) {
-    this._retargetTimer -= dt;
-    if (this._retargetTimer <= 0) {
-      this._retargetTimer = RETARGET_INTERVAL;
-      this._retarget(playerWorldPos);
+  get hunting() {
+    return this.state === "active" && this.mode === "hunt";
+  }
+
+  // Chase pace; grows the longer it has been out.
+  get speed() {
+    return Math.min(MAX_SPEED, BASE_SPEED + ACCEL * this.chaseTime);
+  }
+
+  distanceTo(p) {
+    return Math.hypot(this.pos.x - p.x, this.pos.z - p.z);
+  }
+
+  // Pick a reachable point away from the player and start the pre-echo
+  // there. Returns the events to play, or null if nowhere suitable exists yet.
+  summon(ctx, minDist) {
+    const spot = chooseSpawn(ctx.graph, ctx.signs, ctx.playerNav, ctx.playerForward, minDist);
+    if (!spot) return null;
+    this.state = "incoming";
+    this.timer = RETRO_LEAD;
+    this.spawnAt = spot;
+    return [{ type: "preEcho", pos: spot, lead: RETRO_LEAD }];
+  }
+
+  update(dt, ctx) {
+    const events = [];
+    this.uniforms.uTime.value = ctx.time;
+    switch (this.state) {
+      case "dormant":
+        return events;
+      case "retry": {
+        this.timer -= dt;
+        if (this.timer <= 0) {
+          const ev = this.summon(ctx, 7);
+          if (ev) events.push(...ev);
+          else this.timer = 1;
+        }
+        return events;
+      }
+      case "incoming":
+        this.timer -= dt;
+        if (this.timer <= 0) {
+          this._appear(this.spawnAt);
+          events.push({ type: "materialize", pos: { x: this.pos.x, z: this.pos.z } });
+        }
+        return events;
+      case "materializing":
+        this.dissolve = Math.max(0, this.dissolve - dt / MATERIALIZE_TIME);
+        if (this.dissolve === 0) this.state = "active";
+        break;
+      case "decohering":
+        this.dissolve = Math.min(1, this.dissolve + dt / DECOHERE_TIME);
+        if (this.dissolve === 1) {
+          this.mesh.visible = false;
+          this.light.intensity = 0;
+          const ev = this.summon(ctx, 10);
+          if (ev) events.push(...ev);
+          else {
+            this.state = "retry";
+            this.timer = 1;
+          }
+          return events;
+        }
+        break;
+      case "active":
+        this._act(dt, ctx, events);
+        break;
     }
-    this._advance(dt);
-    this.light.position.set(this.mesh.position.x, this.mesh.position.y + 0.3, this.mesh.position.z);
-    this.light.intensity = DEMON_LIGHT_BASE + proximity * DEMON_LIGHT_EXTRA;
-
-    // Ported from customer.js: `skinMat.emissive.setRGB(0, rand<p?g:0, rand<p?b:0)`,
-    // now added on top of the always-on baseline above rather than
-    // replacing it, so between flicker spikes it stays visible instead of
-    // dropping back toward black. Frequency and punch both climb with
-    // proximity, so it visibly destabilizes as it closes in.
-    this._flickerTimer -= dt;
-    if (this._flickerTimer <= 0) {
-      this._flickerTimer = 0.03 + Math.random() * 0.05;
-      const p = 0.2 + proximity * 0.6;
-      this.material.emissive.setRGB(
-        0,
-        BASE_EMISSIVE_G + (Math.random() < p ? 0.3 + proximity * 0.5 : 0),
-        BASE_EMISSIVE_B + (Math.random() < p ? 0.5 + proximity * 0.5 : 0)
-      );
-    }
-
-    this.mesh.rotation.y = elapsed * 0.6; // a slow spin reads as "wrong", not idle
+    this._animate(dt, ctx);
+    return events;
   }
 
-  _retarget(playerWorldPos) {
-    const demonCell = this.house.cellAtWorld(this.mesh.position.x, this.mesh.position.z);
-    const playerCell = this.house.cellAtWorld(playerWorldPos.x, playerWorldPos.z);
-    const targetCell = resolveTargetCell(this.house, playerCell, demonCell);
-    const path = bfsPath(this.house, demonCell, targetCell) ?? [];
-
-    this._path = path.map((c) => {
-      const w = this.house.toWorld(c.x, c.y);
-      return new THREE.Vector3(w.x, DEMON_HEIGHT / 2, w.z);
-    });
-    if (this._path.length && this.mesh.position.distanceTo(this._path[0]) < WAYPOINT_EPS) {
-      this._path.shift();
-    }
+  _appear(spot) {
+    this.pos.set(spot.x, 0, spot.z);
+    this.state = "materializing";
+    this.dissolve = 1;
+    this.mesh.visible = true;
+    this.path = [];
+    this.hasRoute = false;
+    this.repathTimer = 0;
+    this.noRouteFor = 0;
+    this.strandedFor = 0;
+    this.patrolWait = 0;
+    this.graphVersion = -1;
+    this.cued = null;
   }
 
-  _advance(dt) {
-    if (!this._path.length) return;
-    const target = this._path[0];
-    const dir = new THREE.Vector3().subVectors(target, this.mesh.position);
-    dir.y = 0;
-    const dist = dir.length();
-    if (dist < WAYPOINT_EPS) {
-      this._path.shift();
+  _decohere(events) {
+    this.state = "decohering";
+    this.path = [];
+    events.push({ type: "decohere", pos: { x: this.pos.x, z: this.pos.z } });
+  }
+
+  _act(dt, ctx, events) {
+    this.chaseTime += dt;
+    const hunt = !ctx.playerSafe;
+    if (hunt !== (this.mode === "hunt")) {
+      // Player ducked into (or stepped out of) a safe room: drop the old
+      // route and start the other behaviour from scratch.
+      this.mode = hunt ? "hunt" : "patrol";
+      this.path = [];
+      this.repathTimer = 0;
+      this.patrolWait = 0;
+      this.noRouteFor = 0;
+      this.strandedFor = 0;
+    }
+
+    if (hunt) this._hunt(dt, ctx);
+    else this._patrol(dt, ctx);
+    if (this.state !== "active") {
+      if (this.state === "decohering") events.push({ type: "decohere", pos: { x: this.pos.x, z: this.pos.z } });
       return;
     }
-    dir.normalize();
-    this.mesh.position.addScaledVector(dir, Math.min(this.speed * dt, dist));
+
+    const speed = hunt ? this.speed : this.speed * PATROL_FACTOR;
+    this._walk(dt, speed, hunt);
+
+    if (this.path.length) {
+      this.stepTimer -= dt;
+      if (this.stepTimer <= 0) {
+        this.stepTimer = THREE.MathUtils.clamp(1.8 / speed, 0.26, 0.9);
+        events.push({
+          type: "footstep",
+          pos: this.predict(RETRO_LEAD, speed),
+          lead: RETRO_LEAD,
+          strength: hunt ? 1 : 0.5,
+        });
+      }
+      const cue = this._thresholdCue(ctx, speed);
+      if (cue) events.push(cue);
+    }
   }
-}
 
-// If the player is hidden in a room, the demon can't follow them in -- it
-// heads for the nearest cell that's actually connected to that room by an
-// open wall (a real doorway), not just the geometrically nearest corridor
-// cell, so it can't "cheat" through a wall it hasn't found a way around.
-function resolveTargetCell(house, playerCell, demonCell) {
-  const room = house.roomAt(playerCell.x, playerCell.y);
-  if (!room) return playerCell;
+  _hunt(dt, ctx) {
+    this.repathTimer -= dt;
+    if (this.repathTimer <= 0 || ctx.graphVersion !== this.graphVersion) {
+      this.repathTimer = REPATH_INTERVAL;
+      this.graphVersion = ctx.graphVersion;
+      const route = planPath(ctx.graph, this.pos, ctx.playerPos);
+      this.hasRoute = !!route;
+      this.path = route ? route.points.slice() : [];
+    }
+    if (!this.hasRoute) {
+      this.noRouteFor += dt;
+      if (this.noRouteFor > TUNNEL_AFTER) this.state = "decohering";
+      return;
+    }
+    this.noRouteFor = 0;
+    // Final leg is always straight at the player's live position.
+    if (this.path.length === 1) this.path[0] = { x: ctx.playerPos.x, z: ctx.playerPos.z };
+  }
 
-  let best = null;
-  let bestDist = Infinity;
-  for (const [rx, ry] of room.cells) {
-    const cell = house.cells[ry][rx];
-    for (const d of DIRS) {
-      if (cell[d.wall]) continue;
-      const nx = rx + d.dx;
-      const ny = ry + d.dy;
-      if (nx < 0 || ny < 0 || nx >= house.width || ny >= house.height) continue;
-      if (house.cells[ny][nx].room) continue;
-      const dist = Math.hypot(nx - demonCell.x, ny - demonCell.y);
-      if (dist < bestDist) {
-        bestDist = dist;
-        best = { x: nx, y: ny };
+  _patrol(dt, ctx) {
+    if (!canLeave(ctx.graph, this.pos)) {
+      this.strandedFor += dt;
+      if (this.strandedFor > STRANDED_AFTER) {
+        this.state = "decohering";
+        return;
+      }
+    } else {
+      this.strandedFor = 0;
+    }
+    if (ctx.graphVersion !== this.graphVersion) {
+      this.graphVersion = ctx.graphVersion;
+      this.path = [];
+      this.patrolWait = 0;
+    }
+    if (this.patrolWait > 0) {
+      this.patrolWait -= dt;
+      return;
+    }
+    if (!this.path.length) {
+      const route = this._pickPatrolRoute(ctx);
+      if (route) this.path = route;
+      else this.patrolWait = 1;
+    }
+  }
+
+  // Somewhere reachable that is neither trivially close to it nor right at
+  // the player's room, favouring spots near the player so it keeps lurking.
+  _pickPatrolRoute(ctx) {
+    const fromMe = distanceField(ctx.graph, this.pos);
+    const options = [];
+    for (const c of spawnCandidates(ctx.signs)) {
+      const d = fromMe(c);
+      if (!Number.isFinite(d) || d < PATROL_MIN_LEG) continue;
+      const away = Math.hypot(c.x - ctx.playerPos.x, c.z - ctx.playerPos.z);
+      if (away < PATROL_KEEP_AWAY) continue;
+      options.push({ c, near: away <= PATROL_NEAR_RANGE });
+    }
+    if (!options.length) return null;
+    const near = options.filter((o) => o.near);
+    const pool = near.length ? near : options;
+    const target = pool[(Math.random() * pool.length) | 0].c;
+    const route = planPath(ctx.graph, this.pos, target);
+    return route ? route.points.slice() : null;
+  }
+
+  _walk(dt, speed, hunt) {
+    let budget = speed * dt;
+    while (budget > 0 && this.path.length) {
+      const wp = this.path[0];
+      const dx = wp.x - this.pos.x;
+      const dz = wp.z - this.pos.z;
+      const d = Math.hypot(dx, dz);
+      if (d <= budget) {
+        this.pos.x = wp.x;
+        this.pos.z = wp.z;
+        budget -= d;
+        if (this.path.length > 1) {
+          this.path.shift();
+        } else if (hunt) {
+          break; // hunting: the last waypoint is the player -- stay on them
+        } else {
+          this.path.shift();
+          this.patrolWait = 0.8 + Math.random() * 2; // reached the patrol spot: linger
+        }
+      } else {
+        this.pos.x += (dx / d) * budget;
+        this.pos.z += (dz / d) * budget;
+        budget = 0;
       }
     }
   }
-  return best ?? demonCell;
+
+  // Where the demon will be `lead` seconds from now if it keeps its route.
+  predict(lead, speed = this.speed) {
+    let remaining = speed * lead;
+    let px = this.pos.x;
+    let pz = this.pos.z;
+    for (const wp of this.path) {
+      const d = Math.hypot(wp.x - px, wp.z - pz);
+      if (d >= remaining) {
+        const t = d > 0 ? remaining / d : 0;
+        return { x: px + (wp.x - px) * t, z: pz + (wp.z - pz) * t };
+      }
+      remaining -= d;
+      px = wp.x;
+      pz = wp.z;
+    }
+    return { x: px, z: pz };
+  }
+
+  // Fires once, before the demon comes through a corridor mouth into the
+  // player's hub (whether they're standing in it or hiding in its room) --
+  // the click comes from that doorway, ahead of the demon.
+  _thresholdCue(ctx, speed) {
+    const hub = ctx.playerHub;
+    if (hub !== this.cueHub) {
+      this.cueHub = hub;
+      this.cued = null;
+    }
+    if (hub < 0) return null;
+    let acc = 0;
+    let px = this.pos.x;
+    let pz = this.pos.z;
+    for (const wp of this.path) {
+      acc += Math.hypot(wp.x - px, wp.z - pz);
+      px = wp.x;
+      pz = wp.z;
+      if (wp.edge === undefined || wp.node !== hub) continue;
+      const key = `${hub}:${wp.edge}`;
+      if (acc > 0.5 && acc <= speed * RETRO_LEAD && this.cued !== key) {
+        this.cued = key;
+        return { type: "threshold", pos: { x: wp.x, z: wp.z }, lead: acc / speed };
+      }
+      return null;
+    }
+    return null;
+  }
+
+  _animate(dt, ctx) {
+    const p = ctx.proximity;
+    this._jitterTimer -= dt;
+    if (this._jitterTimer <= 0) {
+      this._jitterTimer = 0.05 + Math.random() * 0.08;
+      const j = 0.03 + p * 0.09;
+      this._jitter.set((Math.random() - 0.5) * j, (Math.random() - 0.5) * j * 0.5, (Math.random() - 0.5) * j);
+      this.mesh.scale.set(1, 1 + (Math.random() - 0.5) * (0.04 + p * 0.1), 1);
+    }
+    this.mesh.position.set(
+      this.pos.x + this._jitter.x,
+      HEIGHT / 2 + Math.sin(ctx.time * 1.7) * 0.05 + this._jitter.y,
+      this.pos.z + this._jitter.z
+    );
+    this.mesh.rotation.y = ctx.time * 0.6;
+    this.uniforms.uIntensity.value = p;
+    this.uniforms.uDissolve.value = this.dissolve;
+    const flicker = 0.75 + 0.25 * Math.sin(ctx.time * 43) * Math.sin(ctx.time * 17);
+    this.light.intensity = (1 - this.dissolve) * (8 + 14 * p) * flicker;
+    this.light.position.set(this.pos.x, HEIGHT * 0.7, this.pos.z);
+  }
 }
 
-// BFS over non-room cells only -- the demon's whole world is the corridor
-// network, which is exactly the piece step 3 swaps for real labyrinth-v1
-// connectivity (target.edge_signs) instead of the recursive backtracker.
-function bfsPath(house, startCell, targetCell) {
-  const { cells, width, height } = house;
-  if (startCell.x === targetCell.x && startCell.y === targetCell.y) return [startCell];
-
-  const key = (x, y) => `${x},${y}`;
-  const visited = new Set([key(startCell.x, startCell.y)]);
-  const queue = [[startCell]];
-
-  while (queue.length) {
-    const path = queue.shift();
-    const cur = path[path.length - 1];
-    const cell = cells[cur.y][cur.x];
-
-    for (const d of DIRS) {
-      if (cell[d.wall]) continue;
-      const nx = cur.x + d.dx;
-      const ny = cur.y + d.dy;
-      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-      if (cells[ny][nx].room) continue;
-      const k = key(nx, ny);
-      if (visited.has(k)) continue;
-      visited.add(k);
-
-      const nextPath = [...path, { x: nx, y: ny }];
-      if (nx === targetCell.x && ny === targetCell.y) return nextPath;
-      queue.push(nextPath);
+// Reachable spot at least `minDist` (walking) from the player, preferring
+// behind them and a middling distance -- close enough to matter soon, far
+// enough to be fair.
+function chooseSpawn(graph, signs, playerNav, forward, minDist) {
+  const distTo = distanceField(graph, playerNav);
+  let best = null;
+  let bestScore = -Infinity;
+  let farthest = null;
+  let farthestD = -1;
+  for (const c of spawnCandidates(signs)) {
+    const d = distTo(c);
+    if (!Number.isFinite(d)) continue;
+    if (d > farthestD) {
+      farthestD = d;
+      farthest = c;
+    }
+    if (d < minDist) continue;
+    const vx = c.x - playerNav.x;
+    const vz = c.z - playerNav.z;
+    const len = Math.hypot(vx, vz) || 1;
+    const behind = -(vx * forward.x + vz * forward.z) / len;
+    const distScore = 1 - Math.min(1, Math.abs(d - 20) / 20);
+    const score = behind + distScore * 0.6 + Math.random() * 0.15;
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
     }
   }
-  return null;
+  return best ?? (farthestD >= 5 ? farthest : null);
 }

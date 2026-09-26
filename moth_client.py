@@ -1,15 +1,25 @@
-"""Asynchronous Moth API wrapper (Atlas `blur-v1` + Tessa Compressor).
+"""Asynchronous Moth API wrapper.
 
 Two layers:
 
 * ``MothClient`` -- pure ``asyncio`` + ``httpx`` coroutines with a ``diskcache``
-  layer and graceful fallbacks (any failure returns the original bytes).
+  layer and graceful fallbacks: nothing here raises on a network or API
+  failure (blur/compress return the original bytes, job calls return None).
 * ``MothWorker`` -- runs a private event loop in a daemon thread so the FastAPI
   handlers can fire requests and poll ``is_busy`` without ever blocking.
 
-NOTE: the real Moth endpoint URLs / auth scheme are not documented in this repo.
-``BASE_URL`` and the two paths below are placeholders -- override them via the
-``MOTH_API_BASE`` / ``MOTH_API_KEY`` environment variables or constructor args.
+Atlas job lifecycle (``submit_job`` / ``job_status`` / ``job_result`` /
+``run_job``) is CONFIRMED against the live API on 2026-09-26:
+
+    base  https://api.mothquantum.com/api/v1   (Bearer MOTH_API_KEY)
+    POST  /engines/{engine_id}/process   {"params": {...}, "input_files": {...}}
+          -> 202 {"job_id": "...", "status": "queued"}
+    GET   /jobs/{job_id}/status   -> {"status": "queued|processing|completed|failed",
+                                      "progress": {"step": ..., "detail": ...}, "steps": [...]}
+    GET   /jobs/{job_id}/result   -> {"result": {"output": {...}}}
+
+NOTE: ``ATLAS_BLUR_PATH`` / ``TESSA_COMPRESS_PATH`` below are still unverified
+placeholders carried over from an earlier project; nothing in this game uses them.
 """
 
 from __future__ import annotations
@@ -21,20 +31,26 @@ import os
 import threading
 from concurrent.futures import Future
 from pathlib import Path
-from typing import Any, Coroutine, Optional
+from typing import Any, Callable, Coroutine, Optional
 
 import httpx
 from diskcache import Cache
 
 log = logging.getLogger("moth_client")
 
-BASE_URL = os.environ.get("MOTH_API_BASE", "https://api.moth.example")
-ATLAS_BLUR_PATH = "/v1/atlas/blur-v1"
-TESSA_COMPRESS_PATH = "/v1/tessa/compress"
+BASE_URL = os.environ.get("MOTH_API_BASE", "https://api.mothquantum.com/api/v1")
+ATLAS_BLUR_PATH = "/v1/atlas/blur-v1"  # UNVERIFIED placeholder
+TESSA_COMPRESS_PATH = "/v1/tessa/compress"  # UNVERIFIED placeholder
 
 MOCK_DELAY_SECONDS = 0.5
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_CACHE_DIR = Path(os.environ.get("MOTH_CACHE_DIR", Path(__file__).parent / ".moth_cache"))
+
+RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+TERMINAL_FAILURE_STATES = frozenset({"failed", "cancelled", "canceled", "error"})
+
+# Called with a small dict every time a tracked job changes state.
+JobUpdate = Callable[[dict[str, Any]], None]
 
 
 class MothClient:
@@ -73,6 +89,90 @@ class MothClient:
             "tessa-compress", TESSA_COMPRESS_PATH, data, {"quality": str(quality)}
         )
 
+    async def submit_job(
+        self, engine_id: str, params: dict[str, Any], input_files: Optional[dict[str, str]] = None
+    ) -> Optional[str]:
+        """Queue an Atlas job. Returns its job_id, or None on any failure."""
+        body = await self._json(
+            "POST",
+            f"/engines/{engine_id}/process",
+            json={"params": params, "input_files": input_files or {}},
+        )
+        job_id = body.get("job_id") if isinstance(body, dict) else None
+        return str(job_id) if job_id else None
+
+    async def job_status(self, job_id: str) -> Optional[dict[str, Any]]:
+        return await self._json("GET", f"/jobs/{job_id}/status")
+
+    async def job_result(self, job_id: str) -> Optional[dict[str, Any]]:
+        return await self._json("GET", f"/jobs/{job_id}/result")
+
+    async def run_job(
+        self,
+        engine_id: str,
+        params: dict[str, Any],
+        *,
+        input_files: Optional[dict[str, str]] = None,
+        poll_interval: float = 3.0,
+        timeout: float = 600.0,
+        on_update: Optional[JobUpdate] = None,
+        job_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Submit, poll until done, and return the /result body. Pass `job_id`
+        to resume tracking an already-submitted job instead (no new charge).
+
+        Returns None -- never raises -- on submission failure, a failed job, or
+        timeout; `on_update` is told which ("failed" / "timeout") and why.
+        """
+
+        def emit(**update: Any) -> None:
+            if on_update is None:
+                return
+            try:
+                on_update(update)
+            except Exception:  # a broken observer must not kill the job
+                log.exception("job update callback failed")
+
+        if self.mock_mode:
+            emit(state="failed", error="client is in mock mode (no API key)")
+            return None
+
+        if job_id is None:
+            job_id = await self.submit_job(engine_id, params, input_files)
+            if not job_id:
+                emit(state="failed", error="submission rejected or API unreachable")
+                return None
+            emit(state="queued", job_id=job_id)
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        last = None
+        while True:
+            status = await self.job_status(job_id)
+            state = str(status.get("status", "unknown")) if isinstance(status, dict) else "unreachable"
+            progress = status.get("progress") if isinstance(status, dict) else None
+            step = progress.get("step") if isinstance(progress, dict) else None
+            if (state, step) != last:
+                last = (state, step)
+                log.info("%s job %s -> %s%s", engine_id, job_id, state, f" ({step})" if step else "")
+                emit(state=state, job_id=job_id, step=step)
+
+            if state == "completed":
+                result = await self.job_result(job_id)
+                if result is None:
+                    emit(state="failed", job_id=job_id, error="completed but /result unreadable")
+                return result
+            if state in TERMINAL_FAILURE_STATES:
+                error = None
+                if isinstance(status, dict):
+                    error = status.get("error") or status.get("message") or status.get("detail")
+                emit(state="failed", job_id=job_id, error=str(error)[:200] if error else state)
+                return None
+            if loop.time() > deadline:
+                emit(state="timeout", job_id=job_id, error=f"still '{state}' after {timeout:.0f}s")
+                return None
+            await asyncio.sleep(poll_interval)
+
     async def aclose(self) -> None:
         if self._http is not None:
             await self._http.aclose()
@@ -80,6 +180,45 @@ class MothClient:
         self.cache.close()
 
     # ---------------------------------------------------------------- internals
+
+    def _client(self) -> httpx.AsyncClient:
+        if self._http is None:
+            self._http = httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout)
+        return self._http
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
+    async def _json(self, method: str, path: str, **kwargs: Any) -> Optional[dict[str, Any]]:
+        """Authenticated JSON call with backoff on transient failures.
+
+        Returns the decoded JSON object, or None on any failure (logged).
+        """
+        headers = {**self._auth_headers(), **kwargs.pop("headers", {})}
+        for attempt in range(1, 4):
+            try:
+                resp = await self._client().request(method, path, headers=headers, **kwargs)
+            except httpx.HTTPError as exc:
+                log.warning("Moth %s %s failed (%r), attempt %d/3", method, path, exc, attempt)
+                if attempt < 3:
+                    await asyncio.sleep(2.0**attempt)
+                    continue
+                return None
+            if resp.status_code in RETRYABLE_STATUS and attempt < 3:
+                delay = _retry_after(resp, 2.0**attempt)
+                log.warning("Moth %s %s -> %s, retrying in %.1fs", method, path, resp.status_code, delay)
+                await asyncio.sleep(delay)
+                continue
+            if resp.is_error:
+                log.warning("Moth %s %s -> %s: %s", method, path, resp.status_code, resp.text[:300])
+                return None
+            try:
+                body = resp.json()
+            except ValueError:
+                log.warning("Moth %s %s returned non-JSON", method, path)
+                return None
+            return body if isinstance(body, dict) else None
+        return None
 
     def _cache_key(self, op: str, payload: bytes, params: dict[str, str]) -> str:
         h = hashlib.sha256()
@@ -117,13 +256,9 @@ class MothClient:
     async def _call_api(
         self, path: str, payload: bytes, params: dict[str, str]
     ) -> Optional[bytes]:
-        if self._http is None:
-            self._http = httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout)
-        headers = {"Content-Type": "application/octet-stream"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        headers = {"Content-Type": "application/octet-stream", **self._auth_headers()}
         try:
-            resp = await self._http.post(
+            resp = await self._client().post(
                 path, content=payload, params=params, headers=headers
             )
             if resp.status_code == 429:
@@ -136,6 +271,13 @@ class MothClient:
         except httpx.HTTPError as exc:
             log.warning("Moth request to %s failed (%r); using original asset", path, exc)
         return None
+
+
+def _retry_after(resp: httpx.Response, default: float) -> float:
+    try:
+        return min(30.0, float(resp.headers.get("Retry-After", default)))
+    except ValueError:
+        return default
 
 
 class MothWorker:
@@ -168,7 +310,7 @@ class MothWorker:
         with self._lock:
             return self._pending > 0
 
-    def submit(self, coro: Coroutine[Any, Any, bytes]) -> Future:
+    def submit(self, coro: Coroutine[Any, Any, Any]) -> Future:
         """Schedule a client coroutine; returns a ``concurrent.futures.Future``."""
         with self._lock:
             self._pending += 1
